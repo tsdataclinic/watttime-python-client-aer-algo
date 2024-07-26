@@ -9,6 +9,7 @@ import datetime
 import pytz
 from datetime import datetime, timedelta
 from watttime import WattTimeForecast, WattTimeHistorical
+from watttime.api_data_cache import DataCache
 
 import optimizer.s3 as s3u
 import evaluation.eval_framework as efu
@@ -22,11 +23,8 @@ region = "PJM_NJ"
 username = os.getenv("WATTTIME_USER")
 password = os.getenv("WATTTIME_PASSWORD")
 
-
-
-actual_data = WattTimeHistorical(username, password)
-hist_data = WattTimeForecast(username, password)
-
+actual_moer_data = WattTimeHistorical(username, password)
+hist_fcst_data = WattTimeForecast(username, password)
 
 
 s3 = s3u.s3_utils()
@@ -35,85 +33,102 @@ generated_data = s3.load_csvdataframe(file=key)
 
 
 synth_data = generated_data.copy(deep=True)
-synth_data = synth_data.head(1)
 
-synth_data["plug_in_time"] = pd.to_datetime(synth_data["plug_in_time"])
-synth_data["unplug_time"] = pd.to_datetime(synth_data["unplug_time"])
+# Sort by time if you want to minimize the data loaded (all rows will be for the same date)
+synth_data = synth_data.sort_values('plug_in_time') 
+synth_data = synth_data.head(100)
 
 
+time_zone = efu.get_timezone_from_dict(region)
+synth_data["plug_in_time"] = pd.to_datetime(synth_data["plug_in_time"]).apply(lambda x: efu.convert_to_utc(x, time_zone))
+synth_data["unplug_time"] = pd.to_datetime(synth_data["unplug_time"]).apply(lambda x: efu.convert_to_utc(x, time_zone))
+
+# Context for which to load and cache data
+data_start = synth_data['plug_in_time'].min()
+data_end = synth_data['unplug_time'].max()
+
+print(f"Loading data for context: {data_start} to {data_end}")
+
+forecast_data_cache = efu.setup_forecast_moer_data_cache(data_start, data_end, region)
+moer_data_cache = efu.setup_actual_moer_data_cache(data_start, data_end, region)
+
+
+# Gets moer forecasts at plug-in-time
 synth_data['moer_data'] = synth_data.apply(
     lambda x: efu.get_historical_fcst_data(
-    x.plug_in_time,
-    math.ceil(x.total_intervals_plugged_in),
-    region = region
+        forecast_data_cache,
+        x.plug_in_time,
     ), axis = 1
 )
 
+# Get actual moer from plug-in to unplug_time
 synth_data['moer_data_actual'] = synth_data.apply(
     lambda x: efu.get_historical_actual_data(
-    x.plug_in_time,
-    math.ceil(x.total_intervals_plugged_in),
-    region = region
+        moer_data_cache, 
+        x.plug_in_time,
+        x.unplug_time,
     ), axis = 1
 )
 
-synth_data['charger_simple']= synth_data.apply(
-    lambda x: efu.get_schedule_and_cost(
+
+# Gets a charging schedule based on moer forecasts at plug-in time
+synth_data['charger_simple_predicted'] = synth_data.apply(
+    lambda x: efu.setup_charger(
         x.MWh_fraction,
-        x.charged_kWh_actual / 1000,
-        math.ceil(x.total_intervals_plugged_in), # will throw an error if the plug in time is too shart to reach full charge, should soften to a warning
+        x.charge_MWh_needed,
+        math.floor(x.total_intervals_plugged_in), # will throw an error if the plug in time is too shart to reach full charge, should soften to a warning
         x.moer_data,
         asap = False
-        ), 
-        axis = 1
-        )
-
-synth_data['charger_simple_actual']= synth_data.apply(
-    lambda x: efu.get_schedule_and_cost(
-        x.MWh_fraction,
-        x.charged_kWh_actual / 1000,
-        math.ceil(x.total_intervals_plugged_in), # will throw an error if the plug in time is too shart to reach full charge, should soften to a warning
-        x.moer_data_actual,
-        asap = False
-        ), 
-        axis = 1
-        )
-
-
-synth_data['simple_fit_results'] = synth_data['charger_simple'].apply(
-    lambda  x: x.get_total_cost()
-    )
-
-synth_data['simple_fit_results_actual'] = synth_data['charger_simple_actual'].apply(
-    lambda  x: x.get_total_cost()
-    )
-
-
-print(synth_data['simple_fit_results'])
-print(synth_data['simple_fit_results_actual'])
-
-# TO DO: this currently optimizes twice, which is unecessary
-# I would refactor out 
-
-# make this a function
-
-'''
-moer_actuals = actual_data.get_historical_pandas(
-    start=generated_data.plug_in_time.min(),
-    end=generated_data.unplug_time.max(),
-    region=region
+    ), 
+    axis = 1
 )
 
-# adapt this function
-def sum_moer_actuals(
-    moer_data,
-    time_zone,
-    MWh_fraction,
-    plug_in_time,
-    number_conseq_intervals
-    ):
-    plug_in_time_utc=evu.convert_to_utc(plug_in_time, time_zone)
-    index_lower_limit = moer_data[moer_data.point_time >= plug_in_time_utc].index[0]
-    index_upper_limit = index_lower_limit + int(number_conseq_intervals)
-    return sum(moer_data[index_lower_limit: index_upper_limit]["value"] * MWh_fraction)
-'''
+# Gets a "perfect" charging schedule based on actual moer
+synth_data['charger_simple_actual_perfect'] = synth_data.apply(
+    lambda x: efu.setup_charger(
+        x.MWh_fraction,
+        x.charge_MWh_needed,
+        math.floor(x.total_intervals_plugged_in), # will throw an error if the plug in time is too shart to reach full charge, should soften to a warning
+        x.moer_data_actual,
+        asap = False
+    ), 
+    axis = 1
+)
+
+# Setup an ASAP charger based on actual moer ()
+synth_data['charger_asap_actual'] = synth_data.apply(
+    lambda x: efu.setup_charger(
+        x.MWh_fraction,
+        x.charge_MWh_needed,
+        math.floor(x.total_intervals_plugged_in), # will throw an error if the plug in time is too shart to reach full charge, should soften to a warning
+        x.moer_data_actual,
+        asap = True
+    ), 
+    axis = 1
+)
+
+
+# Gets projected cost of charging (predicted emissons))
+synth_data['simple_fit_results_predicted'] = synth_data['charger_simple_predicted'].apply(
+    lambda  x: x.get_total_cost() if x is not None else None
+)
+
+# Gets actual cost of using schedule produced at plug in time (actual emissions using predictions)
+synth_data['simple_fit_results_realized'] = synth_data.apply(
+    lambda x: efu.get_actual_cost_of_schedule(x.charger_simple_predicted, x.moer_data_actual),
+    axis=1
+)
+
+# Gets cost given we had the actual data (optimal behavior based on perfect info)
+synth_data['simple_fit_results_perfect'] = synth_data['charger_simple_actual_perfect'].apply(
+    lambda  x: x.get_total_cost() if x is not None else None
+)
+
+# Gets cost of doing ASAP charging (baseline behavior)
+synth_data['asap_fit_results_actual'] = synth_data['charger_asap_actual'].apply(
+    lambda  x: x.get_total_cost() if x is not None else None
+)
+
+
+
+print(synth_data[['simple_fit_results_predicted', 'simple_fit_results_realized', 'simple_fit_results_perfect', 'asap_fit_results_actual']])

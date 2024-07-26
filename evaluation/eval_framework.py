@@ -16,6 +16,8 @@ from evaluation.config import TZ_DICTIONARY
 
 import watttime.shared_anniez.alg.optCharger as optC
 import watttime.shared_anniez.alg.moer as Moer
+from watttime.api_data_cache import DataCache
+import time
 
 username = os.getenv("WATTTIME_USER")
 password = os.getenv("WATTTIME_PASSWORD")
@@ -128,10 +130,6 @@ def generate_synthetic_user_data(
     total_capacity = round(random.uniform(21, 123))
     mean_length_charge = round(random.uniform(20000, 30000))
     std_length_charge = round(random.uniform(6800, 8000))
-
-    # print(
-    #   f"working on user with {total_capacity} total_capacity, {power_output_max_rate} rate of charge, and ({mean_length_charge/3600},{std_length_charge/3600}) charging behavior."
-    # )
 
     # This generates a dataset with a unique date per user
     user_df = (
@@ -316,45 +314,67 @@ def get_timezone_from_dict(key, dictionary=TZ_DICTIONARY):
 
 
 # Get per-row historical fcsts at 'plug in time'
-def get_historical_fcst_data(plug_in_time, horizon, region):
-
-    time_zone = get_timezone_from_dict(region)
-    plug_in_time = pd.Timestamp(convert_to_utc(plug_in_time, time_zone))
-    horizon = math.ceil(horizon / 12)
-
-    hist_data = WattTimeForecast(username, password)
-    return hist_data.get_historical_forecast_pandas(
-        start=plug_in_time - pd.Timedelta(minutes=5),
-        end=plug_in_time,
-        horizon_hours=horizon,
-        region=region,
+def get_historical_fcst_data(data_cache, plug_in_time):
+    return data_cache.get_data(
+        plug_in_time - pd.Timedelta(minutes=5),
+        plug_in_time,
     )
 
-def get_historical_actual_data(plug_in_time, horizon, region):
-
-    time_zone = get_timezone_from_dict(region)
-    plug_in_time = pd.Timestamp(convert_to_utc(plug_in_time, time_zone))
-    horizon = math.ceil(horizon / 12)
-
-    hist_data = WattTimeHistorical(username, password)
-    return hist_data.get_historical_pandas(
-        start=plug_in_time - pd.Timedelta(minutes=5),
-        end=plug_in_time + pd.Timedelta(hours=horizon),
-        region=region,
+# Get per-row actual moer data
+def get_historical_actual_data(data_cache, plug_in_time, unplug_time):
+    return data_cache.get_data(
+        plug_in_time,
+        unplug_time
     )
 
 
 # Set up OptCharger based on moer fcsts and get info on projected schedule
-def get_schedule_and_cost(
+def setup_charger(
     charge_rate_per_window, charge_needed, total_time_horizon, moer_data, asap=False
 ):
     charger = optC.OptCharger(charge_rate_per_window)  # charge rate needs to be an int
     moer = Moer.Moer(moer_data["value"])
 
-    charger.fit(
-        totalCharge=charge_needed,  # also currently an int value
-        totalTime=total_time_horizon,
-        moer=moer,
-        asap=asap,
+    # Here the charger throws an error if there's not enough time. Currently I just set the charger
+    # to None and don't provide any addl metrics if this is the case because based on our assumption 
+    # that we know the unplug time, there is no available optimization. 
+    try:
+        charger.fit(
+            totalCharge=charge_needed,  # also currently an int value
+            totalTime=total_time_horizon,
+            moer=moer,
+            asap=asap,
+        )
+        return charger
+    except Exception as e:
+        return None
+
+def get_actual_cost_of_schedule(charger, actual_moer) -> float:
+    if charger is None:
+        return None
+    charging_schedule = charger.get_schedule()
+    return sum(actual_moer["value"][:len(charging_schedule)] * charging_schedule)
+
+def setup_forecast_moer_data_cache(data_start, data_end, region: str) -> DataCache:
+    start = time.time()
+    hist_fcst_query = WattTimeForecast(username, password)
+    data = hist_fcst_query.get_historical_forecast_pandas(
+        start=data_start - pd.Timedelta(minutes=5), 
+        end = data_end + pd.Timedelta(minutes=5), 
+        horizon_hours=72, region=region
     )
-    return charger
+    end = time.time()
+    print(f"Loaded historical forecast moer data, took {end - start} time")
+    return DataCache(data, "generated_at")
+
+def setup_actual_moer_data_cache(data_start, data_end, region: str) -> DataCache:
+    start = time.time()
+    hist_data_query = WattTimeHistorical(username, password)
+    data = hist_data_query.get_historical_pandas(
+        start=data_start, 
+        end = data_end + pd.Timedelta(minutes=5), 
+        region=region
+    )
+    end = time.time()
+    print(f"Loaded historiical actual moer data, took {end - start} time")
+    return DataCache(data, "point_time")
