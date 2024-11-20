@@ -317,6 +317,10 @@ class OptCharger:
         This is the __diagonal_fit() algorithm with further constraint on contiguous charging intervals and their respective length 
         """
         print("== Fixed contiguous fit! ==")
+        if totalCharge < 0:
+            print("Something is wrong: total charge is negative. totalCharge: {totalCharge}. Setting to 0 for now.")
+            totalCharge = 0
+    
         # print("Charge per interval constraints:", charge_per_interval)
         totalInterval = len(charge_per_interval)
         # This is a matrix with size = number of time states x number of intervals charged so far
@@ -356,6 +360,7 @@ class OptCharger:
                         initVal = False
                             
         if np.isnan(maxUtil[totalTime,totalInterval]): 
+            print(maxUtil)
             ## TODO: In this case we should still return the best possible plan
             ## which would probably to just charge for the entire window
             raise Exception("Solution not found!")
@@ -545,7 +550,12 @@ class OptCharger:
             emission_multiplier_fn = lambda sc, ec: 1.0
             constant_emission_multiplier = True
         else:
-            constant_emission_multiplier = np.std([emission_multiplier_fn(sc,sc+1) for sc in list(range(totalCharge))]) < EMISSION_FN_TOL
+            if totalCharge > 0:
+                constant_emission_multiplier = np.std([emission_multiplier_fn(sc,sc+1) for sc in list(range(totalCharge))]) < EMISSION_FN_TOL
+            else:
+                constant_emission_multiplier = True
+
+
         # Store emission_multiplier_fn for evaluation
         self.emission_multiplier_fn = emission_multiplier_fn
         if totalCharge > totalTime:
